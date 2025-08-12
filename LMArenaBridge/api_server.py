@@ -23,9 +23,23 @@ from packaging.version import parse as parse_version
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse
 
 # --- 导入自定义模块 ---
 from modules import image_generation
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from collections import deque, defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class RequestSummary:
+    request_id: str
+    model: str
+    start_time: float
+    end_time: Optional[float] = None
+    success: Optional[bool] = None
+    error: Optional[str] = None
 
 # --- 基础配置 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -353,6 +367,20 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("服务器正在关闭。")
 
+# --- Metrics ---
+request_count = Counter('lmarena_requests_total', 'Total number of requests', ['model', 'status', 'type'])
+request_duration = Histogram('lmarena_request_duration_seconds', 'Request duration in seconds', ['model', 'type'], buckets=(0.1,0.5,1.0,2.5,5.0,10.0,30.0,60.0,120.0,float('inf')))
+active_requests_gauge = Gauge('lmarena_active_requests', 'Number of active requests')
+websocket_status = Gauge('lmarena_websocket_connected', 'WebSocket connection status (1=connected, 0=disconnected)')
+# --- Realtime stats for monitor ---
+realtime_stats = {
+    'active': {},  # request_id -> RequestSummary
+    'recent': deque(maxlen=500),  # list[dict]
+    'errors': deque(maxlen=200),
+    'model_usage': defaultdict(lambda: {'requests': 0, 'errors': 0, 'avg_duration': 0.0}),
+}
+monitor_clients = set()
+
 app = FastAPI(lifespan=lifespan)
 
 # --- CORS 中间件配置 ---
@@ -370,6 +398,26 @@ app.add_middleware(
 async def health():
     """简易健康检查，供容器/反向代理探测。"""
     return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
+
+@app.get("/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/api/stats/summary")
+async def stats_summary():
+    try:
+        active_count = len(realtime_stats['active'])
+        models = {k: v for k, v in realtime_stats['model_usage'].items()}
+        return JSONResponse({
+            'browser_connected': browser_ws is not None,
+            'active_requests': active_count,
+            'recent_requests': len(realtime_stats['recent']),
+            'errors': len(realtime_stats['errors']),
+            'model_usage': models,
+            'time': datetime.utcnow().isoformat() + 'Z'
+        })
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=500)
 
 # --- 辅助函数 ---
 def save_config():
@@ -723,6 +771,19 @@ async def stream_generator(request_id: str, model: str):
     # 只有在 _process_lmarena_stream 自然结束后 (即收到 [DONE]) 才执行
     yield format_openai_finish_chunk(model, response_id, reason=finish_reason_to_send)
     logger.info(f"STREAMER [ID: {request_id[:8]}]: 流式生成器正常结束。")
+    # record metrics
+    dur = time.time()-start_t
+    request_duration.labels(model=model, type='chat').observe(dur)
+    request_count.labels(model=model, status='success', type='chat').inc()
+    if request_id in realtime_stats['active']:
+        summary = realtime_stats['active'].pop(request_id)
+        summary.end_time = time.time(); summary.success=True
+        realtime_stats['recent'].append(vars(summary))
+        mu = realtime_stats['model_usage'][model]
+        prev = mu['requests']; mu['requests'] = prev+1
+        mu['avg_duration'] = (mu['avg_duration']*prev + dur)/(prev+1)
+        # broadcast end
+        await _broadcast_monitor({"type":"request_end","request_id":request_id,"duration":dur})
 
 async def non_stream_response(request_id: str, model: str):
     """聚合内部事件流并返回单个 OpenAI JSON 响应。"""
@@ -759,6 +820,18 @@ async def non_stream_response(request_id: str, model: str):
     response_data = format_openai_non_stream_response(final_content, model, response_id, reason=finish_reason)
 
     logger.info(f"NON-STREAM [ID: {request_id[:8]}]: 响应聚合完成。")
+    # metrics
+    dur = time.time()-start_t
+    request_duration.labels(model=model, type='chat').observe(dur)
+    request_count.labels(model=model, status='success', type='chat').inc()
+    if request_id in realtime_stats['active']:
+        summary = realtime_stats['active'].pop(request_id)
+        summary.end_time = time.time(); summary.success=True
+        realtime_stats['recent'].append(vars(summary))
+        mu = realtime_stats['model_usage'][model]
+        prev = mu['requests']; mu['requests'] = prev+1
+        mu['avg_duration'] = (mu['avg_duration']*prev + dur)/(prev+1)
+        await _broadcast_monitor({"type":"request_end","request_id":request_id,"duration":dur})
     return Response(content=json.dumps(response_data, ensure_ascii=False), media_type="application/json")
 
 # --- WebSocket 端点 ---
@@ -771,6 +844,9 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.warning("检测到新的油猴脚本连接，旧的连接将被替换。")
     logger.info("✅ 油猴脚本已成功连接 WebSocket。")
     browser_ws = websocket
+    websocket_status.set(1)
+    # notify monitors of ws status
+    await _broadcast_monitor({"type":"ws_status","connected": True})
     try:
         while True:
             # 等待并接收来自油猴脚本的消息
@@ -796,6 +872,8 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.error(f"WebSocket 处理时发生未知错误: {e}", exc_info=True)
     finally:
         browser_ws = None
+        websocket_status.set(0)
+        await _broadcast_monitor({"type":"ws_status","connected": False})
         # 清理所有等待的响应通道，以防请求被挂起
         for queue in response_channels.values():
             await queue.put({"error": "Browser disconnected during operation"})
@@ -965,6 +1043,9 @@ async def chat_completions(request: Request):
 
     request_id = str(uuid.uuid4())
     response_channels[request_id] = asyncio.Queue()
+    realtime_stats['active'][request_id] = RequestSummary(request_id=request_id, model=model_name or "default_model", start_time=time.time())
+    active_requests_gauge.set(len(realtime_stats['active']))
+    await _broadcast_monitor({"type":"request_start","request_id": request_id, "model": model_name or "default_model", "timestamp": time.time()})
     logger.info(f"API CALL [ID: {request_id[:8]}]: 已创建响应通道。")
 
     try:
@@ -1003,6 +1084,12 @@ async def chat_completions(request: Request):
         # 如果在设置过程中出错，清理通道
         if request_id in response_channels:
             del response_channels[request_id]
+        req = realtime_stats['active'].pop(request_id, None)
+        active_requests_gauge.set(len(realtime_stats['active']))
+        if req:
+            req.end_time = time.time(); req.success=False; req.error=str(e)
+            realtime_stats['errors'].append(vars(req))
+            request_count.labels(model=model_name or 'unknown', status='error', type='chat').inc()
         logger.error(f"API CALL [ID: {request_id[:8]}]: 处理请求时发生致命错误: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1040,6 +1127,67 @@ async def start_id_capture():
     except Exception as e:
         logger.error(f"ID CAPTURE: 发送激活指令时出错: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to send command via WebSocket.")
+
+@app.websocket("/ws/monitor")
+async def monitor_ws(ws: WebSocket):
+    await ws.accept()
+    monitor_clients.add(ws)
+    try:
+        await ws.send_json({
+            'type': 'initial',
+            'active_requests': {k: vars(v) for k, v in realtime_stats['active'].items()},
+            'recent_requests': list(realtime_stats['recent']),
+            'errors': list(realtime_stats['errors']),
+            'model_usage': realtime_stats['model_usage'],
+            'browser_connected': browser_ws is not None,
+        })
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        monitor_clients.discard(ws)
+
+@app.get("/monitor", response_class=HTMLResponse)
+async def monitor_page():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset=\"utf-8\" />
+<title>LMArenaBridge Monitor</title>
+<style>body{font-family:system-ui,Arial;margin:0;background:#f5f7fb;color:#111}.header{background:#fff;padding:12px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08);display:flex;align-items:center;justify-content:space-between}.chip{padding:6px 10px;border-radius:999px;background:#eef2ff;color:#3730a3;font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;padding:16px}.card{background:#fff;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.08)}.card .body{padding:12px 16px}.muted{color:#666;font-size:12px}.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word}</style>
+</head>
+<body>
+<div class=\"header\"><div><b>LMArenaBridge Monitor</b></div><div id=\"ws\" class=\"chip\">WS: connecting...</div></div>
+<div class=\"grid\">
+  <div class=\"card\"><div class=\"body\"><div>Active requests</div><div id=\"active\" class=\"mono\"></div></div></div>
+  <div class=\"card\"><div class=\"body\"><div>Recent</div><div id=\"recent\" class=\"mono\"></div></div></div>
+  <div class=\"card\"><div class=\"body\"><div>Errors</div><div id=\"errors\" class=\"mono\"></div></div></div>
+  <div class=\"card\"><div class=\"body\"><div>Model usage</div><div id=\"usage\" class=\"mono\"></div></div></div>
+</div>
+<script>
+const el = (id)=>document.getElementById(id);
+function fmt(obj){try{return JSON.stringify(obj,null,2)}catch{return String(obj)}}
+function setWs(status){const e=el('ws');e.textContent = 'WS: '+status; e.style.background = status==='open'?'#dcfce7':'#fee2e2'; e.style.color = status==='open'?'#166534':'#991b1b';}
+function renderInitial(d){el('active').textContent = fmt(d.active_requests); el('recent').textContent = fmt(d.recent_requests); el('errors').textContent = fmt(d.errors); el('usage').textContent = fmt(d.model_usage);}
+function mergeUsage(usage){const cur = JSON.parse(el('usage').textContent||'{}'); const merged = {...cur}; for (const k in usage){merged[k] = {...(merged[k]||{}), ...usage[k]};} el('usage').textContent = fmt(merged);}
+(function connect(){const proto = location.protocol==='https:'?'wss':'ws'; const ws = new WebSocket(proto+'://'+location.host+'/ws/monitor'); ws.onopen=()=>setWs('open'); ws.onclose=()=>{setWs('closed'); setTimeout(connect, 3000)}; ws.onerror=()=>setWs('error'); ws.onmessage=(ev)=>{const data = JSON.parse(ev.data); if(data.type==='initial'){renderInitial(data);} else if(data.type==='request_start'){const act = JSON.parse(el('active').textContent||'{}'); act[data.request_id]=data; el('active').textContent=fmt(act);} else if(data.type==='request_end'){const act = JSON.parse(el('active').textContent||'{}'); delete act[data.request_id]; el('active').textContent=fmt(act);} else if(data.type==='request_error'){const errs = JSON.parse(el('errors').textContent||'[]'); errs.unshift(data); el('errors').textContent=fmt(errs.slice(0,200));}}})();
+</script>
+</body>
+</html>
+"""
+
+# --- 内部通信端点 ---
+async def _broadcast_monitor(payload: dict):
+    stale = []
+    for ws in list(monitor_clients):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            stale.append(ws)
+    for ws in stale:
+        monitor_clients.discard(ws)
 
 
 # --- 主程序入口 ---
